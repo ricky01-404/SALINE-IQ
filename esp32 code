@@ -1,0 +1,190 @@
+#define CONFIG_ASYNC_TCP_RUNNING_CORE 1
+#define ASYNC_TCP_PRIORITY 3
+#define SERVER_TASK_PRIORITY 2
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <HX711.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+// Wi-Fi credentials
+const char* ssid = "ihithitler";
+const char* password = "ihithitlerr";
+
+// Pin Definitions
+#define TRIG_PIN_1 26
+#define ECHO_PIN_1 25
+#define TRIG_PIN_2 14
+#define ECHO_PIN_2 27
+#define IR_PIN 33
+#define DHT_PIN 32
+#define BUZZER_PIN 15
+#define LOADCELL_DOUT_PIN 4
+#define LOADCELL_SCK_PIN 5
+
+// Constants
+#define DHT_TYPE DHT11
+#define DISTANCE_THRESHOLD 50.0   // cm
+#define WEIGHT_THRESHOLD 50.0     // grams
+
+// Global Objects
+HX711 scale;
+DHT dht(DHT_PIN, DHT_TYPE);
+AsyncWebServer server(80);
+AsyncEventSource events("/events");
+
+// ================= HTML PAGE =================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32 Sensor Dashboard</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      font-family: 'Poppins', sans-serif;
+      text-align: center;
+      background-color: #121212;
+      color: #f1f1f1;
+      margin: 0;
+    }
+    h1 {
+      background: linear-gradient(135deg, #007bff, #00c6ff);
+      padding: 20px;
+      font-size: 24px;
+    }
+    .container {
+      max-width: 500px;
+      margin: 30px auto;
+      background: #1e1e1e;
+      padding: 20px;
+      border-radius: 10px;
+    }
+    .sensor {
+      font-size: 24px;
+      font-weight: bold;
+      color: #00c6ff;
+    }
+  </style>
+</head>
+<body>
+  <h1>ESP32 Sensor Dashboard</h1>
+  <div class="container">
+    <p>Distance 1: <span id="distance1" class="sensor">--</span> cm</p>
+    <p>Distance 2: <span id="distance2" class="sensor">--</span> cm</p>
+    <p>IR Sensor: <span id="irDetected" class="sensor">--</span></p>
+    <p>Humidity: <span id="humidity" class="sensor">--</span> %</p>
+    <p>Temperature: <span id="temperature" class="sensor">--</span> °C</p>
+    <p>Weight: <span id="weight" class="sensor">--</span> g</p>
+  </div>
+
+  <script>
+    if (!!window.EventSource) {
+      var source = new EventSource('/events');
+      source.onmessage = function(e) {
+        var data = JSON.parse(e.data);
+        document.getElementById("distance1").innerText = data.distance1;
+        document.getElementById("distance2").innerText = data.distance2;
+        document.getElementById("irDetected").innerText =
+          data.irDetected ? "Object Detected" : "No Object";
+        document.getElementById("humidity").innerText = data.humidity;
+        document.getElementById("temperature").innerText = data.temperature;
+        document.getElementById("weight").innerText = data.weight;
+      };
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ================= FUNCTIONS =================
+float measureDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  if (duration == 0) return 999.9;
+
+  float distance = duration * 0.034 / 2;
+  return (distance > 400) ? 999.9 : distance;
+}
+
+void initWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    attempts++;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    ESP.restart();
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN_1, OUTPUT);
+  pinMode(ECHO_PIN_1, INPUT);
+  pinMode(TRIG_PIN_2, OUTPUT);
+  pinMode(ECHO_PIN_2, INPUT);
+  pinMode(IR_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  dht.begin();
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale();
+  scale.tare();
+
+  initWiFi();
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", index_html);
+  });
+
+  server.addHandler(&events);
+  server.begin();
+}
+
+// ================= LOOP =================
+void loop() {
+  static unsigned long lastUpdate = 0;
+
+  if (millis() - lastUpdate > 1000) {
+    StaticJsonDocument<256> doc;
+
+    float d1 = measureDistance(TRIG_PIN_1, ECHO_PIN_1);
+    float d2 = measureDistance(TRIG_PIN_2, ECHO_PIN_2);
+    float weight = scale.get_units(3);
+
+    doc["distance1"] = d1;
+    doc["distance2"] = d2;
+    doc["irDetected"] = digitalRead(IR_PIN);
+    doc["humidity"] = dht.readHumidity();
+    doc["temperature"] = dht.readTemperature();
+    doc["weight"] = weight;
+
+    char buffer[256];
+    serializeJson(doc, buffer);
+    events.send(buffer, "message", millis());
+
+    bool alert =
+      (d1 < DISTANCE_THRESHOLD && d1 > 0) ||
+      (d2 < DISTANCE_THRESHOLD && d2 > 0) ||
+      (weight < WEIGHT_THRESHOLD && weight > 0);
+
+    digitalWrite(BUZZER_PIN, alert ? HIGH : LOW);
+    lastUpdate = millis();
+  }
+}
